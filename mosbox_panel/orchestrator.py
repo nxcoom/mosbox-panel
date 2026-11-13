@@ -134,7 +134,7 @@ layer4 {{
 
 def render_sshd_config(path: Path, sshd_port: int, host_key: Path,
                        pid_file: Path, panel_url: str, token: str,
-                       data_root: Path) -> Path:
+                       data_root: Path, ssh_user: str = "root") -> Path:
     text = f"""\
 # MosBox Panel —— puressh sshd 配置(编排器自动生成)
 Port {sshd_port}
@@ -143,7 +143,7 @@ HostKey {host_key}
 PermitRootLogin prohibit-password
 PasswordAuthentication no
 PubkeyAuthentication yes
-AllowUsers root
+AllowUsers {ssh_user}
 AllowTcpForwarding yes
 AllowAgentForwarding no
 X11Forwarding no
@@ -180,10 +180,17 @@ class Child:
         log = open(self.log_path, "ab", buffering=0)
         try:
             log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动 {' '.join(self.argv)}\n".encode())
-            self.proc = subprocess.Popen(
-                self.argv, stdout=log, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL, env=self.env,
-                start_new_session=True, close_fds=True)
+            try:
+                self.proc = subprocess.Popen(
+                    self.argv, stdout=log, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, env=self.env,
+                    start_new_session=True, close_fds=True)
+            except OSError as e:
+                # 二进制缺失/不可执行等:控制台 + 日志双写,保持 proc=None
+                msg = f"[botkeep] ✗ {self.name} 启动失败: {e} (argv0={self.argv[0]})"
+                print(msg, flush=True)
+                log.write(f"{msg}\n".encode())
+                self.proc = None
         finally:
             log.close()
 
@@ -219,7 +226,7 @@ class Child:
 # ----------------------------------------------------------------------
 async def run() -> None:
     app_root = Path(__file__).resolve().parent.parent
-    bin_dir = app_root / "bin"
+    bin_dir = Path(os.environ.get("BKP_BIN_DIR") or (app_root / "bin"))
     data_dir = Path(os.environ.get("BOTKEEP_DATA") or app_root / "data")
     dm = dirs(data_dir)
     cfg = Config(data_dir)   # 公网端口:BOTKEEP_PORT/PORT/SERVER_PORT 环境变量或默认 8800
@@ -242,6 +249,17 @@ async def run() -> None:
     token = token_file.read_text(encoding="utf-8").strip()
 
     # ---- SSH 准备:主机密钥 / 默认公钥 / 授权文件 ----
+    # SSH 登录用户跟随本进程的运行用户(pterodactyl 容器常以无 passwd 条目的
+    # uid 运行,puressh 认证后 setuid 跨 uid 会被 EPERM 拒绝;
+    # puressh 补丁支持 "uid999" 形式的合成用户 = 本进程身份)
+    import pwd
+    uid = os.getuid()
+    try:
+        ssh_user = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        ssh_user = f"uid{uid}"
+    ssh.user = ssh_user
+
     ssh_ready = True
     try:
         ssh.ensure_host_key()
@@ -263,6 +281,17 @@ async def run() -> None:
         target = Path("/usr/local/bin/botkeepctl")
         target.write_text((dm["bin"] / "botkeepctl").read_text(encoding="utf-8"))
         target.chmod(0o755)
+    # SSH 会话 shell 包装器:注入 PATH 后转发到 bash,让交互/命令两种模式
+    # 都能直接用 botkeepctl(合成用户无 passwd,不能依赖 /etc/profile)
+    with contextlib.suppress(Exception):
+        shell_path = dm["bin"] / "mosbox-shell"
+        shell_path.write_text(
+            "#!/bin/bash\n"
+            "# MosBox Panel 会话 shell:补 PATH 后转交 bash\n"
+            'export PATH="$HOME/data/bin:$PATH"\n'
+            'exec /bin/bash "$@"\n',
+            encoding="utf-8")
+        shell_path.chmod(0o755)
 
     # ---- 渲染配置文件 ----
     run_dir = dm["run"]
@@ -271,15 +300,20 @@ async def run() -> None:
         sshd_port, app_root / "frontend")
     sshd_config = render_sshd_config(
         run_dir / "sshd_config", sshd_port, ssh.host_key,
-        run_dir / "sshd.pid", ctx.panel_url, token, dm["root"])
+        run_dir / "sshd.pid", ctx.panel_url, token, dm["root"], ssh_user)
 
     # ---- 拉起子进程 ----
     env = os.environ.copy()
+    # sshd 会话的 HOME 锚定到应用根目录(合成用户的 home 从环境变量读取)
+    if env.get("HOME") != str(app_root):
+        env["BKP_REAL_HOME"] = env.get("HOME", "")
+        env["HOME"] = str(app_root)
+    env["BKP_SHELL"] = str(dm["bin"] / "mosbox-shell")
     children: dict[str, Child] = {}
     if ssh_ready:
         sshd = Child("sshd",
                      [str(bin_dir / "sshd"), "-D", "-f", str(sshd_config),
-                      "-A", str(ssh.authorized_keys), "-u", "root",
+                      "-A", str(ssh.authorized_keys), "-u", ssh_user,
                       "--no-strict-modes", "-E", str(dm["logs"] / "sshd.log")],
                      dm["logs"] / "sshd-boot.log", env, kill_group=False)
         sshd.start()
@@ -293,9 +327,15 @@ async def run() -> None:
         print("[botkeep] SSH 已禁用本次启动", flush=True)
 
     raddy_bin = bin_dir / "raddy"
+    if raddy_bin.exists():
+        head = raddy_bin.read_bytes()[:8]
+        print(f"[botkeep] raddy 二进制: {raddy_bin} {raddy_bin.stat().st_size} 字节 "
+              f"magic={head.hex()}", flush=True)
+    else:
+        print(f"[botkeep] ✗ raddy 二进制不存在: {raddy_bin}", flush=True)
     raddy = Child("raddy",
                   [str(raddy_bin), "run", "--config", str(caddyfile)],
-                  dm["logs"] / "raddy.log", env)
+                  dm["logs"] / "raddy-boot.log", env)
     raddy.start()
     children["raddy"] = raddy
 
@@ -325,16 +365,20 @@ async def run() -> None:
 
     async def watch_children():
         backoff = 2
+        reported_dead: set[str] = set()
         while True:
             await asyncio.sleep(3)
             for name, ch in children.items():
                 if ch.alive:
                     ch.fails = 0
+                    reported_dead.discard(name)
                     continue
                 ch.fails += 1
                 if ch.fails > ch.max_retries:
-                    events.emit("service.died", f"{name} 反复退出,暂停自动拉活",
-                                {"name": name})
+                    if name not in reported_dead:
+                        reported_dead.add(name)
+                        events.emit("service.died", f"{name} 反复退出,暂停自动拉活",
+                                    {"name": name})
                     continue
                 events.emit("service.restart",
                             f"{name} 意外退出(exit={ch.proc.returncode if ch.proc else '?'}),"

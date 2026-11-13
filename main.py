@@ -7,6 +7,7 @@
 4. bin/ 里缺 raddy / puressh sshd 二进制时,从 GitHub Releases 下载
    (botkeep 容器只给单文件上传,二进制走首次启动下载)。
 """
+import contextlib
 import os
 import subprocess
 import sys
@@ -18,7 +19,11 @@ from pathlib import Path
 APP_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(APP_ROOT))
 
-BIN_DIR = APP_ROOT / "bin"
+
+def _bin_dir() -> Path:
+    """二进制目录:默认 APP_ROOT/bin;BKP_BIN_DIR 在 _load_dotenv 之后才可见,
+    所以必须在使用时求值,不能在模块导入时缓存。"""
+    return Path(os.environ.get("BKP_BIN_DIR") or (APP_ROOT / "bin"))
 
 # 固定版本,保证可复现;可用环境变量覆盖
 RADDY_VERSION = os.environ.get("BKP_RADDY_VERSION", "v0.10.0")
@@ -97,6 +102,45 @@ def _extract_binary(tar_path: Path, name: str, dest: Path) -> bool:
     return False
 
 
+def _assemble_from_parts(parts_dir: Path, bin_dir: Path) -> bool:
+    """把上传时切好块的二进制分片(<name>.partNN)拼装回完整文件。
+
+    botkeep 等平台单请求上传有大小限制,deploy.py 会把 bin/ 切成分片放到
+    bkparts/ 目录(随源码一起挂载)。拼装成功后尽力删除分片。
+    """
+    if not parts_dir.is_dir():
+        return False
+    parts = sorted(parts_dir.glob("*.part*"))
+    if not parts:
+        return False
+    groups: dict[str, list[Path]] = {}
+    for p in parts:
+        stem = p.name.rsplit(".part", 1)[0]
+        groups.setdefault(stem, []).append(p)
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    ok_any = False
+    for stem, files in groups.items():
+        dest = bin_dir / stem
+        try:
+            # 分片存在即代表部署方明确要更新该二进制:始终覆盖
+            with open(dest, "wb") as out:
+                for f in files:  # 文件名已排序,part00 < part01 …
+                    out.write(f.read_bytes())
+            dest.chmod(0o755)
+            ok_any = True
+            print(f"[botkeep] ✓ 分片拼装 {stem} ({dest.stat().st_size // 1024} KB)",
+                  flush=True)
+        except OSError as e:
+            print(f"[botkeep] ✗ 拼装 {stem} 失败: {e}", flush=True)
+    if ok_any:
+        for f in parts:
+            with contextlib.suppress(OSError):
+                f.unlink()
+        with contextlib.suppress(OSError):
+            parts_dir.rmdir()
+    return ok_any
+
+
 def _download(url: str, dest: Path) -> bool:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "MosBox-Panel/2.0"})
@@ -113,22 +157,27 @@ def _download(url: str, dest: Path) -> bool:
 
 
 def ensure_binaries() -> None:
-    """bin/ 缺二进制时从 GitHub Releases 下载。"""
-    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    """bin/ 缺二进制时:优先拼装上传分片,否则从 GitHub Releases 下载。"""
+    bin_dir = _bin_dir()
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    # 1) 部署时随源码上传的分片(deploy.py --with-binaries)
+    parts_dir = Path(os.environ.get("BKP_BIN_PARTS") or (APP_ROOT / "bkparts"))
+    _assemble_from_parts(parts_dir, bin_dir)
     missing = []
-    if not (BIN_DIR / "raddy").exists():
+    if not (bin_dir / "raddy").exists():
         missing.append("raddy")
-    if not (BIN_DIR / "sshd").exists():
+    if not (bin_dir / "sshd").exists():
         missing.append("sshd")
     if not missing:
         return
+    # 2) GitHub Releases 兜底下载
     print(f"[botkeep] 缺少二进制 {missing},开始从 GitHub Releases 下载…", flush=True)
     jobs = []
     if "raddy" in missing:
-        jobs.append((RADDY_URL, [("raddy", BIN_DIR / "raddy")]))
+        jobs.append((RADDY_URL, [("raddy", bin_dir / "raddy")]))
     if "sshd" in missing:
-        jobs.append((PURESSH_URL, [("sshd", BIN_DIR / "sshd"),
-                                   ("ssh-keygen", BIN_DIR / "ssh-keygen")]))
+        jobs.append((PURESSH_URL, [("sshd", bin_dir / "sshd"),
+                                   ("ssh-keygen", bin_dir / "ssh-keygen")]))
     for url, targets in jobs:
         with tempfile.TemporaryDirectory(prefix="bkdl-") as td:
             tgz = Path(td) / "pkg.tar.gz"
@@ -154,6 +203,35 @@ if __name__ == "__main__":
     if not _deps_ok():
         _bootstrap_deps()
         os.execv(sys.executable, [sys.executable, str(APP_ROOT / "main.py")])
+
+    # 启动诊断落盘(平台控制台窗口有限,文件是最可靠的取证途径)
+    try:
+        import pwd
+        uid = os.getuid()
+        try:
+            user = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            user = f"uid{uid}"
+        parts_dir = Path(os.environ.get("BKP_BIN_PARTS") or (APP_ROOT / "bkparts"))
+        bin_dir = _bin_dir()
+        dbg = [
+            f"APP_ROOT={APP_ROOT}",
+            f"运行用户: uid={uid} name={user} euid={os.geteuid()}",
+            f"BIN_DIR={bin_dir} exists={bin_dir.is_dir()}",
+            f"BIN 内容: {[(p.name, p.stat().st_size) for p in bin_dir.glob('*')] if bin_dir.is_dir() else 'N/A'}",
+            f"parts_dir={parts_dir} exists={parts_dir.is_dir()}",
+            f"parts 内容: {[p.name for p in sorted(parts_dir.glob('*'))][:25] if parts_dir.is_dir() else 'N/A'}",
+            f"BKP_BIN_DIR={os.environ.get('BKP_BIN_DIR')}",
+            f"BKP_BIN_PARTS={os.environ.get('BKP_BIN_PARTS')}",
+            f"BOTKEEP_PORT={os.environ.get('BOTKEEP_PORT')}",
+            f"APP_ROOT 列表(前 12): {sorted(p.name for p in APP_ROOT.iterdir())[:12]}",
+        ]
+        (APP_ROOT / "data").mkdir(parents=True, exist_ok=True)
+        (APP_ROOT / "data" / "boot-debug.txt").write_text("\n".join(dbg), encoding="utf-8")
+    except Exception as e:
+        with contextlib.suppress(Exception):
+            (APP_ROOT / "data" / "boot-debug.txt").write_text(f"诊断失败: {e!r}", encoding="utf-8")
+
     ensure_binaries()
     import asyncio
     from mosbox_panel.orchestrator import run

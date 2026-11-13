@@ -254,7 +254,8 @@ def make_app(ctx) -> FastAPI:
             "total_count": len(rows),
             "events": events.db.list_events(15),
             "ssh": {"enabled": ssh_conf.get("enabled", True), "port": cfg.port,
-                    "host_key_fp": ctx.ssh.host_key_fp, "key_count": len(db.list_ssh_keys())},
+                    "host_key_fp": ctx.ssh.host_key_fp, "key_count": len(db.list_ssh_keys()),
+                    "user": getattr(ctx.ssh, "user", "root")},
             "r2": r2.public_conf(),
             "version": APP_VERSION,
         }
@@ -755,6 +756,7 @@ def make_app(ctx) -> FastAPI:
             "self_test": ctx.ssh.self_test,
             "features": ctx.ssh.supported_features(),
             "server": "puressh sshd",
+            "user": getattr(ctx.ssh, "user", "root"),
         }
 
     @app.post("/api/ssh/keys")

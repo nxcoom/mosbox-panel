@@ -355,7 +355,7 @@ async function viewDashboard(el) {
           <div class="card-title">${I("ssh")}快速连接</div>
           <div style="display:flex;flex-direction:column;gap:10px;font-size:12.5px">
             <div><div style="color:var(--text-faint);margin-bottom:5px">SSH(与面板同端口)</div>
-              <div class="codebox"><span>ssh -p ${esc(dash.ssh?.port || "")} root@${esc(S.host.split(":")[0])}</span><span class="copy" onclick="copyText('ssh -p ${escAttr(dash.ssh?.port || "")} root@${escAttr(S.host.split(":")[0])}')">${I("copy", 14)}</span></div></div>
+              <div class="codebox"><span>ssh -p ${esc(dash.ssh?.port || "")} ${esc(dash.ssh?.user || "root")}@${esc(S.host.split(":")[0])}</span><span class="copy" onclick="copyText('ssh -p ${escAttr(dash.ssh?.port || "")} ${escAttr(dash.ssh?.user || "root")}@${escAttr(S.host.split(":")[0])}')">${I("copy", 14)}</span></div></div>
             <div><div style="color:var(--text-faint);margin-bottom:5px">面板地址</div>
               <div class="codebox"><span>http://${esc(S.host)}</span><span class="copy" onclick="copyText('http://${escAttr(S.host)}')">${I("copy", 14)}</span></div></div>
           </div>
@@ -897,8 +897,8 @@ async function viewSSH(el) {
         <div class="kv">
           <div class="row"><span class="k">连接命令</span><span class="v"></span></div>
         </div>
-        <div class="codebox" style="margin:6px 0 16px"><span>ssh -p ${escAttr(data.port)} root@${esc(host)}</span>
-          <span class="copy" onclick="copyText('ssh -p ${escAttr(data.port)} root@${escAttr(host)}')">${I("copy", 14)}</span></div>
+        <div class="codebox" style="margin:6px 0 16px"><span>ssh -p ${escAttr(data.port)} ${escAttr(data.user || "root")}@${esc(host)}</span>
+          <span class="copy" onclick="copyText('ssh -p ${escAttr(data.port)} ${escAttr(data.user || "root")}@${escAttr(host)}')">${I("copy", 14)}</span></div>
         <div class="kv">
           <div class="row"><span class="k">服务状态</span><span class="v" style="color:${data.self_test?.ok ? "var(--ok)" : "var(--err)"}">${data.self_test?.ok ? "● 正常" : "● 异常"} · ${esc(data.self_test?.detail || "")}</span></div>
           <div class="row"><span class="k">主机密钥指纹</span><span class="v">${esc(data.host_key_fp)}</span></div>

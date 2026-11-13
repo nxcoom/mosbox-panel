@@ -97,11 +97,20 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBbOngF8zJjVVvAlDWjZnGE83jXrt3aDviPCqIIE5Ju6
 
 ```bash
 export BOTKEEP_API_KEY="bk_live_xxx"          # 或放到上级目录 botkeep-api.txt
-python deploy.py                              # 自动:打包→上传→解压→设端口→重启
+python deploy.py --with-binaries              # 代码 + raddy/sshd 分片一起部署
 ```
 
-平台单文件上传放不下二进制,`deploy.py` 只上传代码;容器首次启动时 `main.py`
-自动从 GitHub Releases 下载 raddy / puressh sshd 到 `bin/`。
+- `deploy.py` 用平台的 `files/upload-batch` 接口逐文件上传(自动建父目录);
+  **不要用 extract 接口** —— 它以 `/` 为目标时和容器根目录的持续变动冲突,必然 409。
+- 二进制按 ≤3MB base64 切片放到 `bkparts/`(平台文件 API 的单请求上限),
+  容器启动时由 `main.py` 自动拼装回 `bin/`。平台文件写入是异步的,
+  上传完成后等 1-2 分钟再重启容器,否则拼装会拿到旧内容。
+- 不带 `--with-binaries` 时,容器首次启动自动从 GitHub Releases 下载官方二进制;
+  ⚠️ raddy 官方发布版要求 GLIBC ≥ 2.38,老版本容器的 python 镜像装不下,
+  本仓库的分片来自 zig 交叉编译(glibc 2.31 兼容)。
+- **SSH 登录用户跟随容器运行时用户**(如 `uid999`,面板「SSH 服务」页会显示
+  确切命令)—— botkeep 容器以无 passwd 条目的 uid 运行,puressh 已打补丁
+  支持这种合成用户;认证后的会话即应用自身身份,无需 setuid。
 
 ## 🗂 目录结构
 
