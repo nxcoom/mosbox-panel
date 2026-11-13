@@ -523,15 +523,15 @@ function wlCreateModal() {
 
 function wlUploadModal() {
   const { mask, close } = modal(`${I("upload")} 上传程序`, `
-    <div class="dropzone" id="up-zone">点击选择或拖拽文件到此处<br><small style="color:var(--text-faint)">支持 .py 单文件 / .zip 完整项目(≤64MB)</small></div>
-    <input type="file" id="up-file" accept=".py,.zip" style="display:none">
+    <div class="dropzone" id="up-zone">点击选择或拖拽文件到此处<br><small style="color:var(--text-faint)">.py 脚本 / .zip 项目 / 二进制可执行程序(≤64MB)</small></div>
+    <input type="file" id="up-file" style="display:none">
     <div class="form-row" style="margin-top:14px"><label>程序名称(可选,默认取文件名)</label><input class="input" id="up-name" placeholder="my-bot"></div>
     <div class="modal-foot"><button class="btn" id="up-cancel">取消</button><button class="btn btn-primary" id="up-ok" disabled>上传</button></div>`);
   let file = null;
   const zone = $("#up-zone", mask), input = $("#up-file", mask);
   const setFile = (f) => {
     if (!f) return;
-    if (!/\.(py|zip)$/i.test(f.name)) { toast("仅支持 .py 或 .zip", "err"); return; }
+    if (f.size > 64 * 1024 * 1024) { toast("文件超过 64MB 限制", "err"); return; }
     file = f;
     zone.innerHTML = `📄 <b>${esc(f.name)}</b> (${fmtBytes(f.size)})`;
     $("#up-ok", mask).disabled = false;
@@ -541,20 +541,51 @@ function wlUploadModal() {
   zone.ondragover = (e) => { e.preventDefault(); zone.classList.add("drag"); };
   zone.ondragleave = () => zone.classList.remove("drag");
   zone.ondrop = (e) => { e.preventDefault(); zone.classList.remove("drag"); setFile(e.dataTransfer.files[0]); };
+  const prog = document.createElement("div");
+  prog.className = "meter";
+  prog.style.cssText = "display:none;margin-top:12px";
+  prog.innerHTML = '<i style="width:0%"></i>';
+  $("#up-name", mask).parentElement.after(prog);
+
+  async function uploadChunked(file, name) {
+    const begin = await api.post("/api/upload/begin", { name });
+    const token = begin.token, CHUNK = begin.chunk || 8192;
+    const total = Math.ceil(file.size / CHUNK);
+    for (let seq = 0; seq < total; seq++) {
+      const buf = new Uint8Array(await file.slice(seq * CHUNK, (seq + 1) * CHUNK).arrayBuffer());
+      let b64 = "";
+      for (let i = 0; i < buf.length; i += 0x8000)
+        b64 += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+      await api.post("/api/upload/chunk", { token, seq, data: btoa(b64) });
+      prog.firstElementChild.style.width = `${Math.round((seq + 1) / total * 100)}%`;
+    }
+    return api.post("/api/upload/finish", { token, name });
+  }
+
   $("#up-cancel", mask).onclick = close;
   $("#up-ok", mask).onclick = async () => {
     if (!file) return;
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("name", $("#up-name", mask).value);
+    const name = $("#up-name", mask).value;
     $("#up-ok", mask).disabled = true;
-    $("#up-ok", mask).textContent = "上传中…";
+    $("#up-ok", mask).textContent = file.size > 12288 ? "分块上传中…" : "上传中…";
+    prog.style.display = "block";
     try {
-      const r = await api.upload("/api/workloads/upload", fd);
+      let r;
+      if (file.size > 12288) r = await uploadChunked(file, name);
+      else {
+        const fd = new FormData();
+        fd.append("file", file); fd.append("name", name);
+        r = await api.upload("/api/workloads/upload", fd);
+      }
       close();
       toast("上传成功,正在打开…", "ok");
       location.hash = `/wl/${r.workload.id}`;
-    } catch (e) { toast(e.message, "err"); $("#up-ok", mask).disabled = false; $("#up-ok", mask).textContent = "上传"; }
+    } catch (e) {
+      toast(e.message, "err");
+      $("#up-ok", mask).disabled = false;
+      $("#up-ok", mask).textContent = "上传";
+      prog.style.display = "none";
+    }
   };
 }
 
@@ -736,6 +767,7 @@ function renderFileManager(body, listApi, fileApi, actionApi, uploadApi, downloa
   const ops = (rel, isDir) => `
     <div class="ops">
       ${!isDir ? `<button class="btn btn-sm btn-icon" title="下载" onclick="location='${downloadApi}?path=${encodeURIComponent(rel)}'">${I("download", 12)}</button>` : ""}
+      ${!isDir ? `<button class="btn btn-sm btn-icon" title="切换可执行位(二进制程序需要)" data-op="chmod" data-p="${escAttr(rel)}">${I("shell", 12)}</button>` : ""}
       <button class="btn btn-sm btn-icon" title="重命名" data-op="rename" data-p="${escAttr(rel)}">${I("edit", 12)}</button>
       <button class="btn btn-sm btn-icon btn-danger" title="删除" data-op="delete" data-p="${escAttr(rel)}">${I("trash", 12)}</button>
     </div>`;
@@ -769,6 +801,11 @@ function renderFileManager(body, listApi, fileApi, actionApi, uploadApi, downloa
         if (op === "delete") {
           if (!await confirmBox("删除", `确认删除 ${p}?`)) return;
           await api.post(actionApi, { action: "delete", path: p });
+        } else if (op === "chmod") {
+          await api.post(actionApi, { action: "chmod", path: p, on: true });
+          toast("已设为可执行", "ok", 1500);
+          load(cwd);
+          return;
         } else if (op === "rename") {
           const name = prompt("新名称", p.split("/").pop());
           if (!name) return;

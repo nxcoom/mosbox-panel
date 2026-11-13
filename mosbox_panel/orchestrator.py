@@ -86,44 +86,26 @@ def _wait_port(port: int, timeout: float = 15.0) -> bool:
 # ----------------------------------------------------------------------
 # 配置文件渲染
 # ----------------------------------------------------------------------
-def render_caddyfile(path: Path, public_port: int, bind: str,
-                     http_port: int, api_port: int, sshd_port: int,
-                     frontend_dir: Path) -> Path:
-    http_site = f"{bind}:{http_port}" if bind not in ("0.0.0.0", "", "::") \
-        else f":{http_port}"
+def render_caddyfile(path: Path, public_port: int,
+                     api_port: int, sshd_port: int) -> Path:
     text = f"""\
 # MosBox Panel —— 由编排器自动生成,请勿手工编辑(重启后会重新生成)
-# 单端口复用:SSH banner ──▶ puressh sshd;其余 ──▶ 面板 HTTP
+# 单端口复用:SSH banner ──▶ puressh sshd;其余(HTTP/WS)──▶ 面板 uvicorn。
+# HTTP 全部交给 uvicorn 原生处理(gzip/安全头由 FastAPI 中间件负责),
+# 避免 raddy HTTP 引擎对公网分段请求体的兼容性问题。
 {{
     admin off
     auto_https off
 }}
 
-{http_site} {{
-    encode gzip
-    @backend path /api/* /p/* /f/* /uploads/*
-    handle @backend {{
-        reverse_proxy 127.0.0.1:{api_port}
-    }}
-    handle {{
-        root * {frontend_dir}
-        try_files {{path}} /index.html
-        file_server
-    }}
-}}
-
 layer4 {{
     :{public_port} {{
         @ssh ssh
-        @ws regexp "(?i)^GET [^\\r\\n]* HTTP/1\\.[01][\\s\\S]{{0,2048}}?upgrade:[ \\t]*websocket"
         route @ssh {{
             proxy 127.0.0.1:{sshd_port}
         }}
-        route @ws {{
-            proxy 127.0.0.1:{api_port}
-        }}
         route {{
-            proxy 127.0.0.1:{http_port}
+            proxy 127.0.0.1:{api_port}
         }}
     }}
 }}
@@ -270,9 +252,9 @@ async def run() -> None:
         print(f"[botkeep] ✗ SSH 准备失败(面板仍会启动,SSH 不可用): {e}", flush=True)
 
     # ---- 内部端口 ----
-    http_port, api_port, sshd_port = _free_port(), _free_port(), _free_port()
+    api_port, sshd_port = _free_port(), _free_port()
     ctx = Ctx(cfg, db, events, auth, sup, stats, r2, ssh, dm)
-    ctx.ports = {"http": http_port, "api": api_port, "sshd": sshd_port}
+    ctx.ports = {"api": api_port, "sshd": sshd_port}
     ctx.panel_url = f"http://127.0.0.1:{api_port}"
 
     # ---- botkeepctl 写入(SSH 会话里直接可用) ----
@@ -296,8 +278,7 @@ async def run() -> None:
     # ---- 渲染配置文件 ----
     run_dir = dm["run"]
     caddyfile = render_caddyfile(
-        run_dir / "Caddyfile", cfg.port, cfg.bind, http_port, api_port,
-        sshd_port, app_root / "frontend")
+        run_dir / "Caddyfile", cfg.port, api_port, sshd_port)
     sshd_config = render_sshd_config(
         run_dir / "sshd_config", sshd_port, ssh.host_key,
         run_dir / "sshd.pid", ctx.panel_url, token, dm["root"], ssh_user)
@@ -339,8 +320,8 @@ async def run() -> None:
     raddy.start()
     children["raddy"] = raddy
 
-    if not _wait_port(http_port, 15):
-        print("[botkeep] ✗ raddy HTTP 端口未就绪,请查看 data/logs/raddy.log", flush=True)
+    if not _wait_port(cfg.port, 15):
+        print("[botkeep] ✗ 公网端口未就绪,请查看 data/logs/raddy.log", flush=True)
 
     # ---- 本面板 API(uvicorn,进程内) ----
     loop = asyncio.get_running_loop()
@@ -418,7 +399,7 @@ async def run() -> None:
     if first_pw:
         print(f"[botkeep] 初始密码   : {first_pw}  (已写入 data/initial_password.txt,"
               f"首次登录后自动删除)", flush=True)
-    print(f"[botkeep] 内部端口   : api={api_port} http={http_port} sshd={sshd_port}", flush=True)
+    print(f"[botkeep] 内部端口   : api={api_port} sshd={sshd_port}", flush=True)
     sys.stdout.flush()
 
     # ---- 信号处理:优雅退出 ----

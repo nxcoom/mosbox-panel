@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import time
 import zipfile
@@ -138,6 +139,14 @@ class FileOps:
         p = self.resolve(rel)
         p.rename(p.with_name(new_name))
 
+    def set_exec(self, rel: str, on: bool = True) -> None:
+        """设置/取消可执行位(二进制程序需要)。"""
+        p = self.resolve(rel)
+        if not p.is_file():
+            raise FileNotFoundError(rel)
+        st = p.stat().st_mode
+        p.chmod(st | 0o111 if on else st & ~0o111)
+
     def save_upload(self, rel: str, data: bytes) -> None:
         p = self.resolve(rel)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -146,6 +155,18 @@ class FileOps:
 
 def make_app(ctx) -> FastAPI:
     app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None)
+    # HTTP 直接由 uvicorn 承载(2.0 起 raddy 只做 L4 SSH 分流):
+    # gzip 补回 raddy encode 的压缩;安全头补回 raddy header 指令
+    from fastapi.middleware.gzip import GZipMiddleware
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        resp = await call_next(request)
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        return resp
     app.state.ctx = ctx
     db, cfg, sup, events, auth, r2, stats = (
         ctx.db, ctx.cfg, ctx.supervisor, ctx.events, ctx.auth, ctx.r2store, ctx.stats)
@@ -320,18 +341,11 @@ def make_app(ctx) -> FastAPI:
         events.emit("workload.create", f"创建程序 {name}", {"id": wid})
         return {"workload": wl_view(db.get_workload(wid))}
 
-    @app.post("/api/workloads/upload")
-    async def upload_workload(request: Request,
-                              file: UploadFile = File(...), name: str = Form("")):
-        guard(request)
-        data = await file.read()
-        if len(data) > MAX_UPLOAD:
-            return JSONResponse({"detail": "文件超过 64MB 限制"}, status_code=413)
-        fname = file.filename or "app"
-        base_name = (name or Path(fname).stem or "app").strip()
+    # ---- 程序创建核心(单文件直传与分块上传共用) ----
+    def _create_workload_from_file(base_name: str, fname: str, data: bytes) -> dict:
         wid = f"wl-{slugify(base_name)}-{os.urandom(3).hex()}"
         if db.get_workload(wid):
-            return JSONResponse({"detail": "名称冲突"}, status_code=409)
+            raise ValueError("名称冲突")
         wdir = sup.workload_dir(wid)
         entry = "main.py"
         if fname.lower().endswith(".zip"):
@@ -345,13 +359,119 @@ def make_app(ctx) -> FastAPI:
                     break
             else:
                 pyfiles = sorted(wdir.rglob("*.py"))
-                entry = pyfiles[0].relative_to(wdir).as_posix() if pyfiles else "main.py"
+                if pyfiles:
+                    entry = pyfiles[0].relative_to(wdir).as_posix()
+                else:
+                    # 没有 .py:找可执行程序(ELF / 带执行位),按路径最短优先
+                    prog = sorted((p for p in wdir.rglob("*")
+                                   if sup._entry_is_program(p)),
+                                  key=lambda p: len(p.parts))
+                    entry = prog[0].relative_to(wdir).as_posix() if prog else "main.py"
         elif fname.lower().endswith(".py"):
             (wdir / fname).write_bytes(data)
             entry = fname
         else:
+            # 任意文件(典型:ELF 二进制、带 shebang 的脚本、node 程序等)
             (wdir / fname).write_bytes(data)
+            if data[:4] == b"\x7fELF":
+                with contextlib.suppress(OSError):
+                    os.chmod(wdir / fname, 0o755)
             entry = fname
+        w = db.create_workload(wid, base_name, entrypoint=entry,
+                               auto_restart=True, autostart=False)
+        events.emit("workload.create", f"上传创建程序 {base_name}", {"id": wid})
+        return wl_view(w)
+
+    @app.post("/api/workloads/upload")
+    async def upload_workload(request: Request,
+                              file: UploadFile = File(...), name: str = Form("")):
+        guard(request)
+        data = await file.read()
+        if len(data) > MAX_UPLOAD:
+            return JSONResponse({"detail": "文件超过 64MB 限制"}, status_code=413)
+        fname = file.filename or "app"
+        base_name = (name or Path(fname).stem or "app").strip()
+        try:
+            return {"workload": _create_workload_from_file(base_name, fname, data)}
+        except ValueError as e:
+            return JSONResponse({"detail": str(e)}, status_code=409)
+
+    # ---- 分块上传(botkeep 平台端口转发对 >16KB 的请求体丢包,大文件
+    #      必须切片;同时也让受限网络下的上传更稳) ----
+    CHUNK_SIZE = 8 * 1024
+    _upload_sessions: dict[str, dict] = {}
+
+    @app.post("/api/upload/begin")
+    async def upload_begin(request: Request):
+        guard(request)
+        body = await request.json()
+        token = secrets.token_hex(8)
+        udir = ctx.dirs["run"] / "uploads" / token
+        udir.mkdir(parents=True, exist_ok=True)
+        # 清理超过 2 小时的僵尸会话
+        now = time.time()
+        for tk, sess in list(_upload_sessions.items()):
+            if now - sess["created"] > 7200:
+                with contextlib.suppress(Exception):
+                    shutil.rmtree(sess["dir"], ignore_errors=True)
+                _upload_sessions.pop(tk, None)
+        _upload_sessions[token] = {"dir": udir, "created": now,
+                                   "name": Path(str(body.get("name") or "file.bin")).name}
+        return {"ok": True, "token": token, "chunk": CHUNK_SIZE}
+
+    @app.post("/api/upload/chunk")
+    async def upload_chunk(request: Request):
+        guard(request)
+        body = await request.json()
+        sess = _upload_sessions.get(str(body.get("token") or ""))
+        if not sess:
+            return JSONResponse({"detail": "上传会话不存在或已过期"}, status_code=404)
+        seq = int(body.get("seq", -1))
+        if seq < 0 or seq > 20000:
+            return JSONResponse({"detail": "seq 非法"}, status_code=400)
+        try:
+            data = base64.b64decode(str(body.get("data") or ""))
+        except Exception:
+            return JSONResponse({"detail": "data 非法"}, status_code=400)
+        if len(data) > 128 * 1024:
+            return JSONResponse({"detail": "分块过大"}, status_code=400)
+        (sess["dir"] / f"part{seq:05d}").write_bytes(data)
+        return {"ok": True, "received": seq}
+
+    @app.post("/api/upload/finish")
+    async def upload_finish(request: Request):
+        guard(request)
+        body = await request.json()
+        token = str(body.get("token") or "")
+        sess = _upload_sessions.pop(token, None)
+        if not sess:
+            return JSONResponse({"detail": "上传会话不存在"}, status_code=404)
+        udir = sess["dir"]
+        parts = sorted(udir.glob("part*"))
+        if not parts:
+            return JSONResponse({"detail": "没有收到任何分块"}, status_code=400)
+        assembled = udir / sess["name"]
+        total = 0
+        with open(assembled, "wb") as out:
+            for p in parts:
+                chunk = p.read_bytes()
+                total += len(chunk)
+                out.write(chunk)
+                p.unlink(missing_ok=True)
+        if total > MAX_UPLOAD:
+            assembled.unlink(missing_ok=True)
+            return JSONResponse({"detail": "文件超过 64MB 限制"}, status_code=413)
+        base_name = (str(body.get("name") or "") or Path(sess["name"]).stem or "app").strip()
+        try:
+            wl = _create_workload_from_file(base_name, sess["name"], assembled.read_bytes())
+        except ValueError as e:
+            return JSONResponse({"detail": str(e)}, status_code=409)
+        finally:
+            with contextlib.suppress(OSError):
+                assembled.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                udir.rmdir()
+        return {"workload": wl}
         w = db.create_workload(wid, base_name, entrypoint=entry,
                                auto_restart=True, autostart=False)
         events.emit("workload.create", f"上传创建程序 {base_name}", {"id": wid})
@@ -493,6 +613,8 @@ def make_app(ctx) -> FastAPI:
                 ops.delete(body["path"])
             elif action == "rename":
                 ops.rename(body["path"], body["name"])
+            elif action == "chmod":
+                ops.set_exec(body["path"], bool(body.get("on", True)))
             else:
                 return JSONResponse({"detail": "未知操作"}, status_code=400)
         except FileNotFoundError as e:
@@ -563,6 +685,8 @@ def make_app(ctx) -> FastAPI:
                 shared_ops.delete(body["path"])
             elif action == "rename":
                 shared_ops.rename(body["path"], body["name"])
+            elif action == "chmod":
+                shared_ops.set_exec(body["path"], bool(body.get("on", True)))
             else:
                 return JSONResponse({"detail": "未知操作"}, status_code=400)
         except (PermissionError, ValueError, OSError, FileNotFoundError) as e:

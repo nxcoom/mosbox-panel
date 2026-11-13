@@ -180,6 +180,22 @@ class WorkloadManager:
             return []
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _entry_is_program(path: Path) -> bool:
+        """入口文件是可直接执行的程序(ELF 二进制或带执行位的非 Python 文件)。"""
+        try:
+            if not path.is_file():
+                return False
+            with open(path, "rb") as f:
+                magic = f.read(4)
+            if magic.startswith(b"\x7fELF"):       # Linux 可执行
+                return True
+            if os.access(path, os.X_OK) and not path.name.endswith(".py"):
+                return True                          # 有执行位(含带 shebang 的脚本)
+            return False
+        except OSError:
+            return False
+
     def _build_argv(self, w: dict) -> list[str]:
         command = (w.get("command") or "").strip()
         if command:
@@ -187,10 +203,13 @@ class WorkloadManager:
             # "python"/"python3" 统一替换为面板当前解释器(容器环境友好)
             if argv and argv[0] in ("python", "python3"):
                 argv[0] = sys.executable
-        else:
-            entry = (w.get("entrypoint") or "main.py").strip()
-            argv = [sys.executable, "-u", entry]
-        return argv
+            return argv
+        wdir = self.workload_dir(w["id"])
+        entry = (w.get("entrypoint") or "main.py").strip()
+        entry_path = wdir / entry
+        if self._entry_is_program(entry_path):
+            return [str(entry_path)]                 # 二进制/可执行脚本直接运行
+        return [sys.executable, "-u", entry]
 
     def _build_env(self, w: dict) -> dict[str, str]:
         env = os.environ.copy()
@@ -456,8 +475,22 @@ class WorkloadManager:
     def import_zip(self, wid: str, zpath: Path) -> None:
         wdir = self.workload_dir(wid)
         with zipfile.ZipFile(zpath) as zf:
-            for member in zf.namelist():
+            for info in zf.infolist():
+                member = info.filename
                 if member.startswith("__MACOSX") or ".." in Path(member).parts:
                     continue
-                zf.extract(member, wdir)
+                zf.extract(info, wdir)
+                # zipfile 不保留 unix 权限 —— 从 external_attr 恢复执行位,
+                # 二进制程序才能直接运行
+                mode = (info.external_attr >> 16) & 0o777
+                if mode & 0o111:
+                    with contextlib.suppress(OSError):
+                        (wdir / member).chmod(0o755)
+        # 兜底:zip 里没记录权限时,按 ELF 魔数补执行位
+        for path in wdir.rglob("*"):
+            if path.is_file() and not os.access(path, os.X_OK):
+                with contextlib.suppress(OSError):
+                    with open(path, "rb") as f:
+                        if f.read(4).startswith(b"\x7fELF"):
+                            path.chmod(0o755)
         (wdir / ".botkeep_deps_ok").unlink(missing_ok=True)

@@ -234,5 +234,13 @@ if __name__ == "__main__":
 
     ensure_binaries()
     import asyncio
+    import traceback
     from mosbox_panel.orchestrator import run
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except Exception:
+        # 启动崩溃取证:平台控制台窗口有限,traceback 必须落盘
+        with contextlib.suppress(Exception):
+            (APP_ROOT / "data" / "startup-error.log").write_text(
+                traceback.format_exc(), encoding="utf-8")
+        raise
