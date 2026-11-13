@@ -109,9 +109,10 @@ python deploy.py --with-binaries              # 代码 + raddy/sshd 分片一起
 - 不带 `--with-binaries` 时,容器首次启动自动从 GitHub Releases 下载官方二进制;
   ⚠️ raddy 官方发布版要求 GLIBC ≥ 2.38,老版本容器的 python 镜像装不下,
   本仓库的分片来自 zig 交叉编译(glibc 2.31 兼容)。
-- **SSH 登录用户跟随容器运行时用户**(如 `uid999`,面板「SSH 服务」页会显示
-  确切命令)—— botkeep 容器以无 passwd 条目的 uid 运行,puressh 已打补丁
-  支持这种合成用户;认证后的会话即应用自身身份,无需 setuid。
+- **SSH 登录用户就是 `root`**(面板「SSH 服务」页有确切命令)—— 容器以
+  非 root uid(如 999)运行应用,puressh 已打补丁把习惯性的 `root` 登录名
+  映射到应用自身身份:认证后的会话即应用用户,能操作面板管理的全部文件;
+  容器沙箱不含真正的 root 特权(这是平台限制,任何途径都拿不到)。
 
 ## 🗂 目录结构
 

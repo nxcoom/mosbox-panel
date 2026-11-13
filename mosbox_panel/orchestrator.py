@@ -231,15 +231,9 @@ async def run() -> None:
     token = token_file.read_text(encoding="utf-8").strip()
 
     # ---- SSH 准备:主机密钥 / 默认公钥 / 授权文件 ----
-    # SSH 登录用户跟随本进程的运行用户(pterodactyl 容器常以无 passwd 条目的
-    # uid 运行,puressh 认证后 setuid 跨 uid 会被 EPERM 拒绝;
-    # puressh 补丁支持 "uid999" 形式的合成用户 = 本进程身份)
-    import pwd
-    uid = os.getuid()
-    try:
-        ssh_user = pwd.getpwuid(uid).pw_name
-    except KeyError:
-        ssh_user = f"uid{uid}"
+    # 登录名统一用 root(用户习惯);容器以非 root uid 运行时,puressh 补丁
+    # 会把 root 映射到进程自身身份(会话即应用身份,免 setuid)。
+    ssh_user = "root"
     ssh.user = ssh_user
 
     ssh_ready = True
