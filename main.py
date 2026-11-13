@@ -25,17 +25,20 @@ def _bin_dir() -> Path:
     所以必须在使用时求值,不能在模块导入时缓存。"""
     return Path(os.environ.get("BKP_BIN_DIR") or (APP_ROOT / "bin"))
 
-# 固定版本,保证可复现;可用环境变量覆盖
+# 二进制下载源:优先本项目 Release(zig 编译,glibc 2.31 兼容,原始 ELF);
+# 失败再回退上游官方 Release(注意:raddy 官方二进制需要 GLIBC ≥ 2.38)。
+# 全部可用环境变量覆盖。
+RELEASE_BASE = os.environ.get(
+    "BKP_RELEASE_BASE",
+    "https://github.com/nxcoom/mosbox-panel/releases/download/v2.0.0")
 RADDY_VERSION = os.environ.get("BKP_RADDY_VERSION", "v0.10.0")
 PURESSH_VERSION = os.environ.get("BKP_PURESSH_VERSION", "v0.2.9")
-RADDY_URL = os.environ.get(
-    "BKP_RADDY_URL",
-    f"https://github.com/fokx/raddy/releases/download/{RADDY_VERSION}/"
-    "raddy-x86_64-unknown-linux-gnu.tar.gz")
-PURESSH_URL = os.environ.get(
-    "BKP_PURESSH_URL",
-    f"https://github.com/KarpelesLab/puressh/releases/download/{PURESSH_VERSION}/"
-    "puressh-v" + PURESSH_VERSION.lstrip("v") + "-linux-x86_64.tar.gz")
+RADDY_URLS = [os.environ.get("BKP_RADDY_URL") or f"{RELEASE_BASE}/raddy",
+              f"https://github.com/fokx/raddy/releases/download/{RADDY_VERSION}/"
+              "raddy-x86_64-unknown-linux-gnu.tar.gz"]
+PURESSH_URLS = [os.environ.get("BKP_PURESSH_URL") or f"{RELEASE_BASE}/sshd",
+                f"https://github.com/KarpelesLab/puressh/releases/download/{PURESSH_VERSION}/"
+                "puressh-v" + PURESSH_VERSION.lstrip("v") + "-linux-x86_64.tar.gz"]
 
 
 def _deps_ok() -> bool:
@@ -172,25 +175,34 @@ def ensure_binaries() -> None:
         return
     # 2) GitHub Releases 兜底下载
     print(f"[botkeep] 缺少二进制 {missing},开始从 GitHub Releases 下载…", flush=True)
-    jobs = []
-    if "raddy" in missing:
-        jobs.append((RADDY_URL, [("raddy", bin_dir / "raddy")]))
-    if "sshd" in missing:
-        jobs.append((PURESSH_URL, [("sshd", bin_dir / "sshd"),
-                                   ("ssh-keygen", bin_dir / "ssh-keygen")]))
-    for url, targets in jobs:
-        with tempfile.TemporaryDirectory(prefix="bkdl-") as td:
-            tgz = Path(td) / "pkg.tar.gz"
-            if not _download(url, tgz):
-                continue
-            for name, dest in targets:
-                if dest.exists():
+    def _install_from(dest: Path, urls: list[str]) -> bool:
+        """依次尝试候选 URL;原始 ELF 直接落盘,tar.gz 解包提取。"""
+        for url in urls:
+            with tempfile.TemporaryDirectory(prefix="bkdl-") as td:
+                f = Path(td) / "dl"
+                if not _download(url, f):
                     continue
-                if _extract_binary(tgz, name, dest):
-                    print(f"[botkeep] ✓ 已安装 {name} ({dest.stat().st_size // 1024} KB)",
-                          flush=True)
-                else:
-                    print(f"[botkeep] ✗ 压缩包里没有 {name}", flush=True)
+                head = f.read_bytes()[:4]
+                if head.startswith(b"\x7fELF"):
+                    dest.write_bytes(f.read_bytes())
+                    dest.chmod(0o755)
+                    return True
+                if head == b"\x1f\x8b" and _extract_binary(f, dest.name, dest):
+                    return True
+                print(f"[botkeep] ✗ {url} 内容无效(非 ELF/压缩包)", flush=True)
+        return False
+
+    for name, dest, urls in (
+            ("raddy", bin_dir / "raddy", RADDY_URLS),
+            ("sshd", bin_dir / "sshd", PURESSH_URLS),
+            ("ssh-keygen", bin_dir / "ssh-keygen",
+             [os.environ.get("BKP_PURESSH_URL") or f"{RELEASE_BASE}/ssh-keygen"])):
+        if name not in missing:
+            continue
+        if _install_from(dest, urls):
+            print(f"[botkeep] ✓ 已安装 {name} ({dest.stat().st_size // 1024} KB)", flush=True)
+        else:
+            print(f"[botkeep] ✗ {name} 所有下载源均失败", flush=True)
 
 
 if __name__ == "__main__":
