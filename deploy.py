@@ -113,13 +113,61 @@ def split_binaries():
     return out
 
 
-def main():
+def create_workload(name: str) -> str:
+    """创建一个新的 python 空白容器,返回 workload id。"""
+    import re as _re
+    if not _re.match(r"^[\w .-]{2,64}$", name):
+        raise SystemExit("✗ 容器名只能包含字母/数字/下划线/点/空格/连字符(2-64 字符)")
+    r = call("POST", "/workloads",
+             {"name": name, "platform": "general", "runtime": "python",
+              "sourceType": "blank"},
+             idem=f"dep-create-{time.time_ns()}")
+    wid = r.get("id") or (r.get("workload") or {}).get("id")
+    if wid:
+        return wid
+    # 创建是排队操作:轮询列表等它出现
+    for _ in range(12):
+        time.sleep(5)
+        for w in call("GET", "/workloads").get("data", []):
+            if w.get("name") == name:
+                return w["id"]
+    raise SystemExit("✗ 创建超时 —— 到 botkeep 面板确认状态后手动部署")
+
+
+def pick_workload():
     wid = os.environ.get("BOTKEEP_WORKLOAD_ID")
+    if wid:
+        return wid
+    wls = call("GET", "/workloads").get("data", [])
+    if not wls:
+        raise SystemExit("✗ 账号下没有容器 —— 用 python deploy.py --create <名称> 创建")
+    print("账号下的容器:")
+    for i, w in enumerate(wls):
+        print(f"  [{i}] {w.get('name')}  {w.get('id')}  ({w.get('state', '')})")
+    if sys.stdin.isatty():
+        choice = input(f"选择要部署的容器 [0-{len(wls) - 1}](回车=0): ").strip()
+        idx = int(choice) if choice else 0
+        return wls[idx]["id"]
+    raise SystemExit("✗ 非交互环境:请 export BOTKEEP_WORKLOAD_ID=<容器id> 或用 --create <名称>")
+
+
+def main():
+    create_name = None
+    if "--create" in sys.argv:
+        i = sys.argv.index("--create")
+        if i + 1 >= len(sys.argv):
+            raise SystemExit("✗ --create 需要容器名: python deploy.py --create mybox")
+        create_name = sys.argv[i + 1]
     with_binaries = "--with-binaries" in sys.argv
-    if not wid:
-        wls = call("GET", "/workloads")
-        wid = wls["data"][0]["id"]
-        print(f"使用 workload: {wid} ({wls['data'][0]['name']})")
+
+    if create_name:
+        print(f"0/4 创建新容器 {create_name} …")
+        wid = create_workload(create_name)
+        print(f"   ✓ 容器 id: {wid}")
+        os.environ["BOTKEEP_WORKLOAD_ID"] = wid
+    else:
+        wid = pick_workload()
+    print(f"目标容器: {wid}")
 
     print("1/4 收集文件…")
     files = collect_files()

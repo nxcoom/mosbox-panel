@@ -94,12 +94,27 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBbOngF8zJjVVvAlDWjZnGE83jXrt3aDviPCqIIE5Ju6
 | `BKP_PURESSH_VERSION` | `v0.2.9` | 二进制自举下载的 puressh 版本 |
 | `BKP_RADDY_URL` / `BKP_PURESSH_URL` | GitHub | 自定义二进制下载地址(内网/镜像场景) |
 
-## 📦 部署到 botkeep 容器(mos-box)
+## 📦 部署
+
+### 部署到新容器(一条命令)
 
 ```bash
 export BOTKEEP_API_KEY="bk_live_xxx"          # 或放到上级目录 botkeep-api.txt
-python deploy.py --with-binaries              # 代码 + raddy/sshd 分片一起部署
+python deploy.py --create mybox2 --with-binaries
 ```
+
+`--create` 会通过 API 创建一个新的 Python 空白容器,然后自动完成:
+上传代码(含 raddy/sshd 分片)→ 设置平台分配的端口 → 启动容器。
+约 1 分钟后面板就在 `http://<节点>:<端口>` 上线。
+
+### 部署到已有容器
+
+```bash
+python deploy.py --with-binaries                          # 交互选择容器
+BOTKEEP_WORKLOAD_ID=<容器id> python deploy.py --with-binaries   # 或直接指定
+```
+
+### 说明
 
 - `deploy.py` 用平台的 `files/upload-batch` 接口逐文件上传(自动建父目录);
   **不要用 extract 接口** —— 它以 `/` 为目标时和容器根目录的持续变动冲突,必然 409。
