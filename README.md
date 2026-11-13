@@ -114,6 +114,19 @@ python deploy.py --with-binaries                          # 交互选择容器
 BOTKEEP_WORKLOAD_ID=<容器id> python deploy.py --with-binaries   # 或直接指定
 ```
 
+### 纯网页部署(不依赖本机脚本)
+
+代码仓库: https://github.com/nxcoom/mosbox-panel (public)
+
+1. botkeep 网页创建新容器(runtime: Python,source: blank)
+2. 容器页 **Environment** 加环境变量 `BOTKEEP_PORT` = 平台分配的端口(Network 页可查)
+3. **GitHub** 页 → Repository URL 填 `https://github.com/nxcoom/mosbox-panel`
+   → Branch `main` → Check repository → 导入方式 **Replace files** → **Sync repository**
+4. 启动/重启容器 —— 首次启动自动从 [Release](https://github.com/nxcoom/mosbox-panel/releases)
+   下载 glibc 兼容的二进制(约 30 秒),控制台会打印初始密码
+
+以后更新:本仓库 push 新代码后,在 botkeep 的 GitHub 页再点一次 **Sync repository** → 重启即可。
+
 ### 说明
 
 - `deploy.py` 用平台的 `files/upload-batch` 接口逐文件上传(自动建父目录);
