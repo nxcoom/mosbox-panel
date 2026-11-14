@@ -100,9 +100,16 @@ class SshManager:
         keygen = self.bin_dir / "ssh-keygen"
         if not keygen.exists():
             keygen = "ssh-keygen"
-        subprocess.run(
-            [str(keygen), "-t", "ed25519", "-f", str(self.host_key), "-N", "", "-q"],
-            check=True, capture_output=True)
+        try:
+            subprocess.run(
+                [str(keygen), "-t", "ed25519", "-f", str(self.host_key), "-N", "", "-q"],
+                check=True, capture_output=True)
+        except (OSError, subprocess.CalledProcessError):
+            # keygen 不可用或失败时,用内嵌密钥兜底
+            # (botkeep 容器首启下载不到 ssh-keygen,导致 SSH 一直起不来)
+            from .hostkey_blob import write_host_key
+            if not write_host_key(self.host_key):
+                raise
         try:
             os.chmod(self.host_key, 0o600)
         except OSError:
